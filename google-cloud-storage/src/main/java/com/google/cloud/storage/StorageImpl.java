@@ -1565,4 +1565,45 @@ final class StorageImpl extends BaseService<StorageOptions> implements Storage, 
         writerFactory.writeSession(this, blobInfo, opts);
     return BlobWriteSessions.of(writableByteChannelSession);
   }
+
+  @Override
+  public BlobInfo internalCreateFrom(Path path, BlobInfo info, Opts<ObjectTargetOpt> opts)
+      throws IOException {
+    if (Files.isDirectory(path)) {
+      throw new StorageException(0, path + " is a directory");
+    }
+    final Map<StorageRpc.Option, ?> optionsMap = opts.getRpcOptions();
+    BlobInfo.Builder builder = info.toBuilder().setMd5(null).setCrc32c(null);
+    BlobInfo updated = opts.blobInfoMapper().apply(builder).build();
+    StorageObject encode = codecs.blobInfo().encode(updated);
+
+    Supplier<String> uploadIdSupplier =
+        ResumableMedia.startUploadForBlobInfo(
+            getOptions(),
+            updated,
+            optionsMap,
+            retryAlgorithmManager.getForResumableUploadSessionCreate(optionsMap));
+    JsonResumableWrite jsonResumableWrite =
+        JsonResumableWrite.of(encode, optionsMap, uploadIdSupplier.get(), 0);
+
+    JsonResumableSession session =
+        ResumableSession.json(
+            HttpClientContext.from(storageRpc),
+            getOptions().asRetryDependencies(),
+            retryAlgorithmManager.idempotent(),
+            jsonResumableWrite);
+    long size = Files.size(path);
+    HttpContentRange contentRange =
+        HttpContentRange.of(ByteRangeSpec.relativeLength(0L, size), size);
+    ResumableOperationResult<StorageObject> put =
+        session.put(RewindableContent.of(path), contentRange);
+    // all exception translation is taken care of down in the JsonResumableSession
+    StorageObject object = put.getObject();
+    if (object == null) {
+      // if by some odd chance the put didn't get the StorageObject, query for it
+      ResumableOperationResult<StorageObject> query = session.query();
+      object = query.getObject();
+    }
+    return codecs.blobInfo().decode(object);
+  }
 }
