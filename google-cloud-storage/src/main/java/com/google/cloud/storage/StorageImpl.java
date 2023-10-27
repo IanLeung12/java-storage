@@ -38,6 +38,7 @@ import com.google.cloud.Policy;
 import com.google.cloud.WriteChannel;
 import com.google.cloud.storage.Acl.Entity;
 import com.google.cloud.storage.BlobReadChannelV2.BlobReadChannelContext;
+import com.google.cloud.storage.BlobWriteSessionConfig.WriterFactory;
 import com.google.cloud.storage.HmacKey.HmacKeyMetadata;
 import com.google.cloud.storage.PostPolicyV4.ConditionV4Type;
 import com.google.cloud.storage.PostPolicyV4.PostConditionsV4;
@@ -90,9 +91,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import java.util.function.Supplier;
-import org.checkerframework.checker.nullness.qual.Nullable;
 
-final class StorageImpl extends BaseService<StorageOptions> implements Storage {
+final class StorageImpl extends BaseService<StorageOptions> implements Storage, StorageInternal {
 
   private static final byte[] EMPTY_BYTE_ARRAY = {};
   private static final String EMPTY_BYTE_ARRAY_MD5 = "1B2M2Y8AsgTpgAmY7PhCfg==";
@@ -110,11 +110,13 @@ final class StorageImpl extends BaseService<StorageOptions> implements Storage {
 
   final HttpRetryAlgorithmManager retryAlgorithmManager;
   final StorageRpc storageRpc;
+  final WriterFactory writerFactory;
 
-  StorageImpl(HttpStorageOptions options) {
+  StorageImpl(HttpStorageOptions options, WriterFactory writerFactory) {
     super(options);
     this.retryAlgorithmManager = options.getRetryAlgorithmManager();
     this.storageRpc = options.getStorageRpcV1();
+    this.writerFactory = writerFactory;
   }
 
   @Override
@@ -227,43 +229,8 @@ final class StorageImpl extends BaseService<StorageOptions> implements Storage {
   @Override
   public Blob createFrom(BlobInfo blobInfo, Path path, int bufferSize, BlobWriteOption... options)
       throws IOException {
-    if (Files.isDirectory(path)) {
-      throw new StorageException(0, path + " is a directory");
-    }
     Opts<ObjectTargetOpt> opts = Opts.unwrap(options).resolveFrom(blobInfo);
-    final Map<StorageRpc.Option, ?> optionsMap = opts.getRpcOptions();
-    BlobInfo.Builder builder = blobInfo.toBuilder().setMd5(null).setCrc32c(null);
-    BlobInfo updated = opts.blobInfoMapper().apply(builder).build();
-    StorageObject encode = codecs.blobInfo().encode(updated);
-
-    Supplier<String> uploadIdSupplier =
-        ResumableMedia.startUploadForBlobInfo(
-            getOptions(),
-            updated,
-            optionsMap,
-            retryAlgorithmManager.getForResumableUploadSessionCreate(optionsMap));
-    JsonResumableWrite jsonResumableWrite =
-        JsonResumableWrite.of(encode, optionsMap, uploadIdSupplier.get(), 0);
-
-    JsonResumableSession session =
-        ResumableSession.json(
-            HttpClientContext.from(storageRpc),
-            getOptions().asRetryDependencies(),
-            retryAlgorithmManager.idempotent(),
-            jsonResumableWrite);
-    long size = Files.size(path);
-    HttpContentRange contentRange =
-        HttpContentRange.of(ByteRangeSpec.relativeLength(0L, size), size);
-    ResumableOperationResult<StorageObject> put =
-        session.put(RewindableContent.of(path), contentRange);
-    // all exception translation is taken care of down in the JsonResumableSession
-    StorageObject object = put.getObject();
-    if (object == null) {
-      // if by some odd chance the put didn't get the StorageObject, query for it
-      ResumableOperationResult<@Nullable StorageObject> query = session.query();
-      object = query.getObject();
-    }
-    return codecs.blobInfo().decode(object).asBlob(this);
+    return internalCreateFrom(path, blobInfo, opts).asBlob(this);
   }
 
   @Override
@@ -1588,5 +1555,14 @@ final class StorageImpl extends BaseService<StorageOptions> implements Storage {
         algorithm,
         () -> storageRpc.get(bucketPb, optionsMap),
         (b) -> Conversions.apiary().bucketInfo().decode(b).asBucket(this));
+  }
+
+  @Override
+  public BlobWriteSession blobWriteSession(BlobInfo blobInfo, BlobWriteOption... options) {
+    Opts<ObjectTargetOpt> opts = Opts.unwrap(options).resolveFrom(blobInfo);
+
+    WritableByteChannelSession<?, BlobInfo> writableByteChannelSession =
+        writerFactory.writeSession(this, blobInfo, opts);
+    return BlobWriteSessions.of(writableByteChannelSession);
   }
 }
